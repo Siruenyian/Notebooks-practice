@@ -414,7 +414,7 @@ def pred_and_plot_image(model: torch.nn.Module,
                         image_path: str, 
                         class_names: List[str] = None, 
                         transform=None,
-                        device: torch.device = device):
+                        device: torch.device = 'cpu'):
     """Makes a prediction on a target image and plots the image with its prediction."""
     
     # 1. Load in image and convert the tensor values to float32
