@@ -23,4 +23,4 @@ def setup(image_path:string, train_transforms:transforms.Compose, test_transform
                                         transform=test_transforms)
     train_dataloader = torch.utils.data.DataLoader(train_data_custom, batch_size=1, shuffle=True)
     test_dataloader = torch.utils.data.DataLoader(test_data_custom, batch_size=1, shuffle=False)
-    return train_dataloader, test_dataloader
+    return train_dataloader, test_dataloader, train_data_custom.classes

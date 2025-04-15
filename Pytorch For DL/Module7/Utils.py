@@ -455,6 +455,7 @@ def pred_and_plot_image(model: torch.nn.Module,
     plt.axis(False);
 
 
+
 # 1. Take in a Dataset as well as a list of class names
 def display_random_images(dataset: torch.utils.data.dataset.Dataset,
                           classes: List[str] = None,
