@@ -4,7 +4,13 @@ import torch
 # loss_fn = nn.CrossEntropyLoss()
 # optimizer = torch.optim.SGD(params=tinyvgg.parameters(), 
 #                             lr=0.1)
-def train_withdataloader(epochs:int, model:torch.nn.module, train_dataloader, test_dataloader, loss_fn, accuracy_fn, optimizer, device:string):
+
+def accuracy_fn(y_true, y_pred):
+    correct = torch.eq(y_true, y_pred).sum().item()
+    acc = (correct / len(y_pred)) * 100
+    return acc
+
+def train_withdataloader(epochs:int, model:torch.nn.Module, train_dataloader, test_dataloader, loss_fn, accuracy_fn, optimizer, device:string):
     # epochs=15
     train_loss_values=[]
     test_loss_values=[]
@@ -49,3 +55,7 @@ def train_withdataloader(epochs:int, model:torch.nn.module, train_dataloader, te
         test_acc_values.append(test_acc)
         epoch_count.append(epoch)
         print(f"Test loss: {test_loss:.5f} | Test accuracy: {test_acc:.2f}%")
+    return {"train_loss": train_loss_values,
+             "train_acc": train_acc_values,
+             "test_loss": test_loss_values,
+             "test_acc": test_acc_values}

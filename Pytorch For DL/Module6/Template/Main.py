@@ -7,8 +7,7 @@ import torchvision.transforms as transforms
 import Engine, Main,Model, Utils, DataSetup
 if __name__ == "__main__":
     print("running")
-    SAVE_PATH="./savedmodels"
-    IMAGE_PATH="./datasets"
+    IMAGE_PATH="/app/dataset"
     device="cuda" if torch.cuda.is_available() else "cpu"
     device="cpu"
     train_transforms = transforms.Compose([
@@ -37,5 +36,6 @@ if __name__ == "__main__":
     output_shape=len(train_dataloader.classes)).to(device)
     loss_fn = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(params=model.parameters(), lr=0.1)
-    Engine.train_withdataloader(10, model, train_dataloader, test_dataloader)
-    torch.save(model.state_dict(), SAVE_PATH)
+    history=Engine.train_withdataloader(10, model, train_dataloader, test_dataloader)
+    MODEL_PATH="/app/Pytorch For DL/models/6_GoingModularModel.pth"
+    torch.save(model.state_dict(), MODEL_PATH)
