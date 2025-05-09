@@ -69,6 +69,31 @@ unsigned char *load_mnist_labels(const char *path, int *number_of_labels)
     return labels;
 }
 
+void Normalize(float *normalizedImg, unsigned char *images, int len)
+{
+    for (int i = 0; i < len; i++)
+    {
+        normalizedImg[i] = images[i] / 255.0f; // Normalize to 0.0 - 1.0
+    }
+}
+
+void OneHotEncode(float *onehotLabels, unsigned char *labels, int len, int numClasses)
+{
+    for (int i = 0; i < len; i++)
+    {
+        for (int j = 0; j < numClasses; j++)
+        {
+            onehotLabels[i * numClasses + j] = (labels[i] == j) ? 1.0f : 0.0f;
+        }
+    }
+    // for (int i = 0; i < numClasses * 20; i++)
+    // {
+    //     printf("%.0f ", onehotLabels[i]);
+    //     if ((i + 1) % numClasses == 0)
+    //         printf("\n");
+    // }
+}
+
 int main()
 {
     const char *image_path = "/app/dataset/MNIST/train-images-idx3-ubyte";
@@ -85,15 +110,28 @@ int main()
     }
 
     printf("Label[0] = %d\n", labels[0]);
-    for (int i = 0; i < 28 * 28; i++)
-    {
-        printf("%3d ", images[i]);
-        if ((i + 1) % 28 == 0)
-            printf("\n");
-    }
+    // what
+    float *normalizedImg = calloc(28 * 28 * num_images, sizeof(float));
+    float *onehotLabels = calloc(10 * num_labels, sizeof(float));
+    Normalize(normalizedImg, images, 28 * 28 * num_images);
+    OneHotEncode(onehotLabels, labels, num_labels, 10);
+    // for (int i = 0; i < 28 * 28; i++)
+    // {
+    //     if (normalizedImg[i] > 0)
+    //     {
+    //         printf("# ", normalizedImg[i] * 255);
+    //     }
+    //     else
+    //     {
+    //         printf("- ", normalizedImg[i]);
+    //     }
+    //     if ((i + 1) % 28 == 0)
+    //         printf("\n");
+    // }
 
     free(images);
     free(labels);
-
+    free(normalizedImg);
+    free(onehotLabels);
     return 0;
 }
