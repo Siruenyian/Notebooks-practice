@@ -142,27 +142,25 @@ float randFloat()
     return ((float)rand()) / RAND_MAX; // returns 0.0 to 1.0
 }
 
-void matmul_batch(float *out, float *X, float *W, int batchSize, int inF, int outF)
+// A: [M x K] - batch of inputs
+// B: [K x N] - weights
+// C: [M x N] - output
+void matmul_batch(float *C, float *A, float *B, int M, int K, int N)
 {
-    // printf("\n\n======= matmul (batched) =======\n\n");
-
-    for (int b = 0; b < batchSize; ++b)
+    for (int m = 0; m < M; ++m)
     {
-        float *x = &X[b * inF];
-        float *xout = &out[b * outF];
+        float *a = &A[m * K];
+        float *c = &C[m * N];
 
-        for (int i = 0; i < outF; ++i)
+        for (int n = 0; n < N; ++n)
         {
             float val = 0.0f;
-            for (int j = 0; j < inF; ++j)
+            for (int k = 0; k < K; ++k)
             {
-                // W[i][j] * x[j]
-                val += W[i * inF + j] * x[j];
+                val += B[k * N + n] * a[k];
             }
-            xout[i] = val;
-            // printf("%.2f ", val);
+            c[n] = val;
         }
-        // printf("\n");
     }
 }
 
@@ -172,6 +170,18 @@ void DotProduct(float *out, float *a, float *b, int size)
     for (int i = 0; i < size; i++)
     {
         out[i] = a[i] * b[i];
+    }
+}
+
+void transpose(float *out, const float *in, int rows, int cols)
+{
+    for (int i = 0; i < rows; ++i)
+    {
+        for (int j = 0; j < cols; ++j)
+        {
+            // out[j][i] = in[i][j]
+            out[j * rows + i] = in[i * cols + j];
+        }
     }
 }
 
@@ -225,7 +235,7 @@ float CalculateCCELoss(float *yPred, float *yTrue, int batchSize, int numClasses
 void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, float *input, int batchSize)
 {
     // printf("\n\n=================input===========\n\n");
-    // for (int i = 0; i < batchSize; ++i)
+    // for (int i = 0; i < 1; ++i)
     // {
     //     for (int j = 0; j < layerSequence[0].inFeature; ++j)
     //     {
@@ -253,10 +263,10 @@ void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, floa
         // store next in z, idk if thisll break or not, this'll probably bite me back in the future :D
         // TODO: make this safe
         layerSequence[layer].z = calloc(batchSize * outF, sizeof(float));
-        memcpy(layerSequence[layer].z, next, batchSize * outF * sizeof(float));
         layerSequence[layer].X = calloc(batchSize * inF, sizeof(float));
+        memcpy(layerSequence[layer].z, next, batchSize * outF * sizeof(float));
         memcpy(layerSequence[layer].X, current, batchSize * inF * sizeof(float));
-        if (layer < numLayers)
+        if (layer < numLayers - 1)
         {
             for (int i = 0; i < batchSize * outF; ++i)
             {
@@ -271,10 +281,10 @@ void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, floa
             next = (temp == temp1) ? temp2 : temp1;
         }
     }
-    softmax_batch(next, layerSequence[2 - 1].outFeature, batchSize);
+    softmax_batch(next, batchSize, layerSequence[numLayers - 1].outFeature);
 
     // printf("\n\nafter softmax\n\n");
-    // for (int i = 0; i < batchSize; i++)
+    // for (int i = 0; i < 1; i++)
     // {
     //     /* code */
     //     for (int j = 0; j < layerSequence[1].outFeature; j++)
@@ -285,7 +295,9 @@ void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, floa
     // }
 
     // plain copy value
-    memcpy(logits, next, batchSize * layerSequence[2 - 1].outFeature * sizeof(float));
+    memcpy(logits, next, batchSize * layerSequence[numLayers - 1].outFeature * sizeof(float));
+    free(temp1);
+    free(temp2);
 }
 
 void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int batchSize, float learningRate)
@@ -300,38 +312,21 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         float *X = layerSequence[layer].X;
         float *z = layerSequence[layer].z;
 
-        // Allocate intermediate buffers
         float *dydx = calloc(batchSize * outF, sizeof(float));
         float *dEdx = calloc(batchSize * outF, sizeof(float));
         float *dEdW = calloc(inF * outF, sizeof(float));
-        float *dEdb = calloc(outF, sizeof(float)); // unused unless bias is enabled
+        float *dEdb = calloc(outF, sizeof(float));
 
         for (int i = 0; i < batchSize * outF; i++)
         {
-            dydx[i] = (layer != numLayers - 1) ? relu_derivative(z[i]) : 1.0f;
+            dydx[i] = (layer < numLayers - 1) ? relu_derivative(z[i]) : 1.0f;
             dEdx[i] = current_dEdy[i] * dydx[i];
         }
 
-        // dEdW = X^T * dEdx
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int i = 0; i < inF; i++)
-            {
-                for (int j = 0; j < outF; j++)
-                {
-                    dEdW[j * inF + i] += X[b * inF + i] * dEdx[b * outF + j];
-                }
-            }
-        }
-
-        // dEdb = sum of dEdx across batches
-        //  for (int j = 0; j < outF; j++)
-        //  {
-        //      for (int b = 0; b < batchSize; b++)
-        //      {
-        //          dEdb[j] += dEdx[b * outF + j];
-        //      }
-        //  }
+        float *XT = malloc(inF * batchSize * sizeof(float));
+        transpose(XT, X, batchSize, inF);
+        matmul_batch(dEdW, XT, dEdx, inF, batchSize, outF);
+        free(XT);
 
         // Gradient descent weight update
         for (int i = 0; i < inF * outF; i++)
@@ -345,27 +340,18 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         //     layerSequence[layer].Bias[j] -= learningRate * dEdb[j] / batchSize;
         // }
 
-        // Compute dEdy for previous layer (for next backprop iteration)
+        // dEdx @ self.W.T
+        float *WT = malloc(outF * inF * sizeof(float));
+        transpose(WT, W, inF, outF);
+        // W is [inF x outF], WT is [outF x inF]
         float *new_dEdy = malloc(batchSize * inF * sizeof(float));
-        for (int b = 0; b < batchSize; b++)
-        {
-            for (int i = 0; i < inF; i++)
-            {
-                float sum = 0;
-                for (int j = 0; j < outF; j++)
-                {
-                    sum += dEdx[b * outF + j] * W[j * inF + i]; // assumes W is transposed (outF x inF)
-                }
-                new_dEdy[b * inF + i] = sum;
-            }
-        }
+        matmul_batch(new_dEdy, dEdx, WT, batchSize, outF, inF);
+        free(WT);
 
-        // Free previously malloc'd dEdy, but only if it was malloc'd inside this loop
         if (layer != numLayers - 1)
         {
             free(current_dEdy);
         }
-        // hand over pointer to next iteration
         current_dEdy = new_dEdy;
 
         free(dydx);
@@ -374,7 +360,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         free(dEdb);
     }
 
-    // Free final dEdy after the loop ends (last one malloc'd in loop)
+    // Free final dEdy after the loop ends
     free(current_dEdy);
 }
 
@@ -476,7 +462,7 @@ int main(int argc, char const *argv[])
     }
     float loss = 0;
     int numClasses = 10;
-    int batchSize = 1200;
+    int batchSize = 2400;
     float *logits = calloc(numClasses * numLabels, sizeof(float));
     float *dEdy = calloc(batchSize * numClasses, sizeof(float));
     for (int i = 0; i < 37; i++)
@@ -486,7 +472,7 @@ int main(int argc, char const *argv[])
         // softmax_batch(logits, batchSize, numLayers - 1);
         Compute_dEdy(dEdy, logits, y, batchSize, numClasses);
         // backrpop problem
-        BackwardProp(layerSequence, dEdy, numLayers, batchSize, 0.01);
+        BackwardProp(layerSequence, dEdy, numLayers, batchSize, 0.1);
         loss = CalculateCCELoss(logits, y, batchSize, numClasses);
         printf("loss: %lf\n", loss);
     }
