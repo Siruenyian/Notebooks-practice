@@ -139,7 +139,7 @@ struct Layer
 
 float randFloat()
 {
-    return ((float)rand()) / RAND_MAX; // returns 0.0 to 1.0
+    return ((float)rand()) / RAND_MAX;
 }
 
 // A: [M x K] - batch of inputs
@@ -165,7 +165,7 @@ void matmul_batch(float *C, float *A, float *B, int M, int K, int N)
 }
 
 // size here is the size of a and b itself
-void DotProduct(float *out, float *a, float *b, int size)
+void Pairwise(float *out, float *a, float *b, int size)
 {
     for (int i = 0; i < size; i++)
     {
@@ -192,18 +192,23 @@ void initWeights(struct Layer *layer)
 
     // Allocate a 1D array of size (inFeature * outFeature)
     layer->Weight = malloc(in * out * sizeof(float));
-    // printf("\n\n=======weight=========\n\n");
-
     for (int i = 0; i < out; ++i)
     {
         for (int j = 0; j < in; ++j)
         {
-            // Row-major: W[i * in + j] => weight from input j to output i
             layer->Weight[i * in + j] = randFloat() * sqrtf(2.0f / (in + out)); // or 0.0
-            // printf(" <%d> ", i * in + j);
-            // printf("%.2lf ", layer->Weight[i * in + j]);
         }
-        // printf("\n\n");
+    }
+}
+
+void initBias(struct Layer *layer)
+{
+    int out = layer->outFeature;
+    layer->Bias = calloc(out, sizeof(float));
+
+    for (int i = 0; i < out; ++i)
+    {
+        layer->Bias[i] = 0;
     }
 }
 
@@ -216,10 +221,8 @@ float CalculateCCELoss(float *yPred, float *yTrue, int batchSize, int numClasses
         for (int j = 0; j < numClasses; j++)
         {
             int idx = i * numClasses + j;
-            // Only compute log where yTrue is 1 (for one-hot)
             if (yTrue[idx] > 0.0f)
             {
-                // added epsilon for stability
                 Loss += yTrue[idx] * logf(yPred[idx] + 1e-7f);
             }
         }
@@ -234,18 +237,10 @@ float CalculateCCELoss(float *yPred, float *yTrue, int batchSize, int numClasses
 
 void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, float *input, int batchSize)
 {
-    // printf("\n\n=================input===========\n\n");
-    // for (int i = 0; i < 1; ++i)
-    // {
-    //     for (int j = 0; j < layerSequence[0].inFeature; ++j)
-    //     {
-    //         printf("%.2f ", input[i * layerSequence[0].inFeature + j]);
-    //     }
-    //     printf("\n\n");
-    // }
-    // FIX maybe
-    float *temp1 = calloc(784 * batchSize, sizeof(float)); // scratch buffer 1
-    float *temp2 = calloc(784 * batchSize, sizeof(float)); // scratch buffer 2
+
+    // allocate 2 buffers
+    float *temp1 = calloc(784 * batchSize, sizeof(float));
+    float *temp2 = calloc(784 * batchSize, sizeof(float));
     float *current = input;
     float *next = temp1;
     for (int layer = 0; layer < numLayers; layer++)
@@ -253,24 +248,35 @@ void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, floa
         int inF = layerSequence[layer].inFeature;
         int outF = layerSequence[layer].outFeature;
         float *W = layerSequence[layer].Weight;
+        float *b = layerSequence[layer].Bias;
 
         // 32->the neuron count
         // 30->the connection on each neuron, same as length of a single training item
-        // printf("Layer %d (%d → %d):\n", layer, inF, outF);
 
-        // Multiply W * current -> next
+        // Multiply current @ W  -> next
         matmul_batch(next, current, W, batchSize, inF, outF);
+
+        for (int b_idx = 0; b_idx < batchSize; b_idx++)
+        {
+            for (int j = 0; j < outF; j++)
+            {
+                next[b_idx * outF + j] += b[j];
+            }
+        }
+
         // store next in z, idk if thisll break or not, this'll probably bite me back in the future :D
         // TODO: make this safe
         layerSequence[layer].z = calloc(batchSize * outF, sizeof(float));
         layerSequence[layer].X = calloc(batchSize * inF, sizeof(float));
         memcpy(layerSequence[layer].z, next, batchSize * outF * sizeof(float));
         memcpy(layerSequence[layer].X, current, batchSize * inF * sizeof(float));
+
+        // Apply ReLU element-wise
         if (layer < numLayers - 1)
         {
-            for (int i = 0; i < batchSize * outF; ++i)
+            for (int i = 0; i < batchSize * outF; i++)
             {
-                next[i] = relu(next[i]); // Apply ReLU element-wise
+                next[i] = relu(next[i]);
             }
         }
 
@@ -281,23 +287,30 @@ void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, floa
             next = (temp == temp1) ? temp2 : temp1;
         }
     }
-    softmax_batch(next, batchSize, layerSequence[numLayers - 1].outFeature);
-
-    // printf("\n\nafter softmax\n\n");
-    // for (int i = 0; i < 1; i++)
-    // {
-    //     /* code */
-    //     for (int j = 0; j < layerSequence[1].outFeature; j++)
-    //     {
-    //         printf("%.2lf ", next[i * layerSequence[1].outFeature + j]);
-    //     }
-    //     printf("\n\n");
-    // }
 
     // plain copy value
     memcpy(logits, next, batchSize * layerSequence[numLayers - 1].outFeature * sizeof(float));
     free(temp1);
     free(temp2);
+}
+
+void clip_gradient(float *grad, int size, float threshold)
+{
+    float norm = 0.0f;
+    for (int i = 0; i < size; i++)
+    {
+        norm += grad[i] * grad[i];
+    }
+    norm = sqrtf(norm);
+
+    if (norm > threshold)
+    {
+        float scale = threshold / norm;
+        for (int i = 0; i < size; i++)
+        {
+            grad[i] *= scale;
+        }
+    }
 }
 
 void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int batchSize, float learningRate)
@@ -311,7 +324,6 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         float *W = layerSequence[layer].Weight;
         float *X = layerSequence[layer].X;
         float *z = layerSequence[layer].z;
-
         float *dydx = calloc(batchSize * outF, sizeof(float));
         float *dEdx = calloc(batchSize * outF, sizeof(float));
         float *dEdW = calloc(inF * outF, sizeof(float));
@@ -328,17 +340,29 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         matmul_batch(dEdW, XT, dEdx, inF, batchSize, outF);
         free(XT);
 
-        // Gradient descent weight update
+        // gradient clip = 5
+        clip_gradient(dEdW, inF * outF, 0.5f);
+
+        // Weight update
         for (int i = 0; i < inF * outF; i++)
         {
             W[i] -= learningRate * dEdW[i];
         }
 
+        for (int j = 0; j < outF; j++)
+        {
+            dEdb[j] = 0.0f;
+            for (int b = 0; b < batchSize; b++)
+            {
+                dEdb[j] += dEdx[b * outF + j];
+            }
+        }
+
         //  Bias update
-        // for (int j = 0; j < outF; j++)
-        // {
-        //     layerSequence[layer].Bias[j] -= learningRate * dEdb[j] / batchSize;
-        // }
+        for (int j = 0; j < outF; j++)
+        {
+            layerSequence[layer].Bias[j] -= learningRate * dEdb[j];
+        }
 
         // dEdx @ self.W.T
         float *WT = malloc(outF * inF * sizeof(float));
@@ -352,6 +376,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         {
             free(current_dEdy);
         }
+
         current_dEdy = new_dEdy;
 
         free(dydx);
@@ -360,16 +385,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         free(dEdb);
     }
 
-    // Free final dEdy after the loop ends
     free(current_dEdy);
-}
-
-void Train(struct Layer layer, int epoch)
-{
-    for (int i = 0; i < epoch; i++)
-    {
-        printf("Epoch %d, Loss: nan, Acc: nan\n", epoch);
-    }
 }
 
 void Compute_dEdy(float *dEdy, float *probs, float *y_true, int batchSize, int nClasses)
@@ -378,7 +394,6 @@ void Compute_dEdy(float *dEdy, float *probs, float *y_true, int batchSize, int n
     for (int i = 0; i < total; i++)
     {
         dEdy[i] = (probs[i] - y_true[i]) / batchSize;
-        // printf("<%lf>", dEdy[i]);
     }
 }
 
@@ -386,7 +401,8 @@ void Normalize(float *normalizedImg, unsigned char *images, int len)
 {
     for (int i = 0; i < len; i++)
     {
-        normalizedImg[i] = images[i] / 255.0f; // Normalize to 0.0 - 1.0
+        // Normalize to 0.0 - 1.0
+        normalizedImg[i] = images[i] / 255.0f;
     }
 }
 
@@ -399,12 +415,62 @@ void OneHotEncode(float *onehotLabels, unsigned char *labels, int len, int numCl
             onehotLabels[i * numClasses + j] = (labels[i] == j) ? 1.0f : 0.0f;
         }
     }
-    // for (int i = 0; i < numClasses * 20; i++)
+}
+
+// label is not one hot encoded ys
+void PredictSingle(int inputIndex, struct Layer *layerSequence, int numLayers, float *X, unsigned char *label, int numClasses)
+{
+    int inputSize = 784;
+
+    float *singleInput = &X[inputIndex * inputSize];
+    float *logitsSingle = calloc(numClasses, sizeof(float));
+
+    ForwardProp(logitsSingle, layerSequence, numLayers, singleInput, 1);
+    softmax_batch(logitsSingle, 1, layerSequence[numLayers - 1].outFeature);
+    printf("=======================\n");
+    printf("Predicted probabilities:\n");
+    // printf("Porbabilities");
+    // for (int i = 0; i < numClasses; i++)
     // {
-    //     printf("%.0f ", onehotLabels[i]);
-    //     if ((i + 1) % numClasses == 0)
-    //         printf("\n");
+    //     printf("x%.4f ", i, logitsSingle[i]);
     // }
+    // printf("\n");
+
+    int predictedClass = 0;
+    float maxProb = logitsSingle[0];
+    for (int i = 1; i < numClasses; i++)
+    {
+        if (logitsSingle[i] > maxProb)
+        {
+            maxProb = logitsSingle[i];
+            predictedClass = i;
+        }
+    }
+
+    printf("Predicted class: %d\n", predictedClass);
+    printf("True label: %d\n", label[inputIndex]);
+    for (int i = 0; i < 28 * 28; i++)
+    {
+        if (singleInput[i] > 0)
+        {
+            printf("# ", singleInput[i] * 255);
+        }
+        else
+        {
+            printf("- ", singleInput[i]);
+        }
+        if ((i + 1) % 28 == 0)
+            printf("\n");
+    }
+    free(logitsSingle);
+}
+
+void Train(struct Layer layer, int epoch)
+{
+    for (int i = 0; i < epoch; i++)
+    {
+        printf("Epoch %d, Loss: nan, Acc: nan\n", epoch);
+    }
 }
 
 int main(int argc, char const *argv[])
@@ -423,68 +489,76 @@ int main(int argc, char const *argv[])
         exit(1);
     }
 
-    printf("Label[0] = %d\n", labels[0]);
     // what
     float *normalizedImg = calloc(28 * 28 * num_images, sizeof(float));
     float *onehotLabels = calloc(10 * numLabels, sizeof(float));
     Normalize(normalizedImg, images, 28 * 28 * num_images);
     OneHotEncode(onehotLabels, labels, numLabels, 10);
-    // for (int i = 0; i < 28 * 28; i++)
-    // {
-    //     if (normalizedImg[i] > 0)
-    //     {
-    //         printf("# ", normalizedImg[i] * 255);
-    //     }
-    //     else
-    //     {
-    //         printf("- ", normalizedImg[i]);
-    //     }
-    //     if ((i + 1) % 28 == 0)
-    //         printf("\n");
-    // }
 
     float *X = normalizedImg;
     float *y = onehotLabels;
-
+    printf("Label[0] = %d\n", labels[0]);
+    for (int i = 0; i < 28 * 28; i++)
+    {
+        if (normalizedImg[i] > 0)
+        {
+            printf("# ", normalizedImg[i] * 255);
+        }
+        else
+        {
+            printf("- ", normalizedImg[i]);
+        }
+        if ((i + 1) % 28 == 0)
+            printf("\n");
+    }
     srand(time(NULL));
 
-    // (input connection, neuron count)
     struct Layer layerSequence[] = {
-        {.inFeature = 784, .outFeature = 32, .activation = RELU},
-        {.inFeature = 32, .outFeature = 10, .activation = NONE}};
+        {.inFeature = 784, .outFeature = 64, .activation = RELU},
+        {.inFeature = 64, .outFeature = 10, .activation = NONE}};
     int numLayers = sizeof(layerSequence) / sizeof(layerSequence[0]);
     printf("there are %d layers in this network\n", numLayers);
 
-    // note:weight is transposed already
     for (int i = 0; i < numLayers; i++)
     {
         initWeights(&layerSequence[i]);
+        initBias(&layerSequence[i]);
     }
     float loss = 0;
     int numClasses = 10;
     int batchSize = 2400;
-    float *logits = calloc(numClasses * numLabels, sizeof(float));
+    float *logits = calloc(numClasses * batchSize, sizeof(float));
     float *dEdy = calloc(batchSize * numClasses, sizeof(float));
-    for (int i = 0; i < 37; i++)
+
+    clock_t t;
+    t = clock();
+    int epoch_count = 100;
+    for (int i = 0; i < epoch_count; i++)
     {
-        /* code */
         ForwardProp(logits, layerSequence, numLayers, X, batchSize);
-        // softmax_batch(logits, batchSize, numLayers - 1);
-        Compute_dEdy(dEdy, logits, y, batchSize, numClasses);
-        // backrpop problem
-        BackwardProp(layerSequence, dEdy, numLayers, batchSize, 0.1);
+        softmax_batch(logits, batchSize, layerSequence[numLayers - 1].outFeature);
+        // printf("truth label: 5, on training guess: \n\n");
+        // for (int i = 0; i < 1; i++)
+        // {
+        //     for (int j = 0; j < layerSequence[numLayers - 1].outFeature; j++)
+        //     {
+        //         printf("%.2lf ", logits[i * layerSequence[numLayers - 1].outFeature + j]);
+        //     }
+        //     printf("\n\n");
+        // }
+        int total = batchSize * numClasses;
+        for (int i = 0; i < total; i++)
+        {
+            dEdy[i] = (logits[i] - y[i]) / batchSize;
+        }
         loss = CalculateCCELoss(logits, y, batchSize, numClasses);
-        printf("loss: %lf\n", loss);
+        printf("epoch #%d, loss: %lf\n", i, loss);
+        BackwardProp(layerSequence, dEdy, numLayers, batchSize, 0.1);
     }
-    // Print result
-    // for (int i = 0; i < 3; i++)
-    // {
-    //     for (int j = 0; j < 3; j++)
-    //     {
-    //         printf("%.4f ", dEdy[i][j]);
-    //     }
-    //     printf("\n");
-    // }
+
+    PredictSingle(1250, layerSequence, numLayers, X, labels, numClasses);
+    PredictSingle(4700, layerSequence, numLayers, X, labels, numClasses);
+    PredictSingle(2512, layerSequence, numLayers, X, labels, numClasses);
 
     free(logits);
     free(dEdy);
@@ -492,6 +566,9 @@ int main(int argc, char const *argv[])
     free(labels);
     free(normalizedImg);
     free(onehotLabels);
-    printf("end program\n");
+    t = clock() - t;
+    double time_taken = ((double)t) / CLOCKS_PER_SEC; // in seconds
+    printf("log: it took %.2lf seconds to execute %d epochs\n", time_taken, epoch_count);
+    printf("=====program end=====\n");
     return 0;
 }
