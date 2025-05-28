@@ -280,10 +280,6 @@ __global__ void CU_relu_derivative(float *grad, float *x, int size)
         grad[idx] *= (x[idx] > 0) ? 1.0f : 0.0f;
     }
 }
-
-__global__ void __CU_ReLU()
-{
-}
 // A: [M x K] - input matrix 1
 // B: [K x N] - input matrix 2
 // C: [M x N] - output matrix
@@ -454,12 +450,146 @@ void CU_UpdateParameter(float *W, const float *dEdW, float learningRate, int M, 
     cudaFree(d_dEdW);
 }
 
+__global__ void ComputeSquaredSum(const float *grad, float *partialSum, int size)
+{
+    __shared__ float sharedSum[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sharedSum[tid] = (i < size) ? grad[i] * grad[i] : 0.0f;
+
+    __syncthreads();
+
+    // Reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            sharedSum[tid] += sharedSum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        partialSum[blockIdx.x] = sharedSum[0];
+    }
+}
+
+__global__ void ScaleGradient(float *grad, int size, float scale)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size)
+    {
+        grad[i] *= scale;
+    }
+}
+
+void CU_ClipGradientValue(float *grad, int size, float threshold)
+{
+    float *d_grad, *d_partialSum;
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+
+    cudaMalloc(&d_grad, size * sizeof(float));
+    cudaMemcpy(d_grad, grad, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&d_partialSum, gridSize * sizeof(float));
+    ComputeSquaredSum<<<gridSize, blockSize>>>(d_grad, d_partialSum, size);
+    cudaDeviceSynchronize();
+
+    float *h_partialSum = (float *)malloc(gridSize * sizeof(float));
+    cudaMemcpy(h_partialSum, d_partialSum, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float normSq = 0.0f;
+    for (int i = 0; i < gridSize; i++)
+    {
+        normSq += h_partialSum[i];
+    }
+    float norm = sqrtf(normSq);
+
+    if (norm > threshold)
+    {
+        float scale = threshold / norm;
+        ScaleGradient<<<gridSize, blockSize>>>(d_grad, size, scale);
+        cudaDeviceSynchronize();
+    }
+
+    cudaMemcpy(grad, d_grad, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Cleanup
+    cudaFree(d_grad);
+    cudaFree(d_partialSum);
+    free(h_partialSum);
+}
+
+__global__ void __CU_Compute_dEdx(float *dEdx, const float *current_dEdy, const float *z, int size, bool apply_relu)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size)
+    {
+        float dydx = apply_relu ? (z[i] > 0.0f ? 1.0f : 0.0f) : 1.0f;
+        dEdx[i] = current_dEdy[i] * dydx;
+    }
+}
+
+void CU_Compute_dEdx(float *dEdx_host, const float *current_dEdy_host, const float *z_host, int batchSize, int outF, bool apply_relu)
+{
+    int size = batchSize * outF;
+    size_t bytes = size * sizeof(float);
+
+    // Allocate device memory
+    float *d_dEdx, *d_current_dEdy, *d_z;
+    cudaMalloc(&d_dEdx, bytes);
+    cudaMalloc(&d_current_dEdy, bytes);
+    cudaMalloc(&d_z, bytes);
+
+    // Copy host data to device
+    cudaMemcpy(d_current_dEdy, current_dEdy_host, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_z, z_host, bytes, cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int blockSize = 256;
+    int gridSize = (size + blockSize - 1) / blockSize;
+    __CU_Compute_dEdx<<<gridSize, blockSize>>>(d_dEdx, d_current_dEdy, d_z, size, apply_relu);
+    cudaDeviceSynchronize();
+
+    // Copy result back to host
+    cudaMemcpy(dEdx_host, d_dEdx, bytes, cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_dEdx);
+    cudaFree(d_current_dEdy);
+    cudaFree(d_z);
+}
+__global__ void CU_MatmulAddBiasKernel(
+    float *next,                       // [batchSize, outF]
+    const float *__restrict__ current, // [batchSize, inF]
+    const float *__restrict__ W,       // [inF, outF]
+    const float *__restrict__ bias,    // [outF]
+    int batchSize,
+    int inF,
+    int outF)
+{
+    int o = blockIdx.x * blockDim.x + threadIdx.x; // output feature index
+    int b = blockIdx.y * blockDim.y + threadIdx.y; // batch index
+
+    if (b < batchSize && o < outF)
+    {
+        float sum = 0.0f;
+        for (int i = 0; i < inF; ++i)
+        {
+            sum += current[b * inF + i] * W[i * outF + o];
+        }
+        next[b * outF + o] = sum + bias[o];
+    }
+}
+
 void ForwardProp(float *logits, struct Layer *layerSequence, int numLayers, float *input, int batchSize)
 {
 
     // allocate 2 buffers
-    float *temp1 = (float *)calloc(784 * batchSize, sizeof(float));
-    float *temp2 = (float *)calloc(784 * batchSize, sizeof(float));
+    float *temp1 = (float *)calloc(4096 * batchSize, sizeof(float));
+    float *temp2 = (float *)calloc(4096 * batchSize, sizeof(float));
     float *current = input;
     float *next = temp1;
     for (int layer = 0; layer < numLayers; layer++)
@@ -537,6 +667,131 @@ void ClipGradientValue(float *grad, int size, float threshold)
     }
 }
 
+__global__ void __CU_ComputeBiasGradient(float *dEdb, const float *dEdx, int batchSize, int outF)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < outF)
+    {
+        float sum = 0.0f;
+        for (int b = 0; b < batchSize; b++)
+        {
+            sum += dEdx[b * outF + j];
+        }
+        dEdb[j] = sum;
+    }
+}
+
+void CU_ComputeBiasGradient(float *dEdb_host, const float *dEdx_device, int batchSize, int outF)
+{
+    float *d_dEdb;
+    cudaMalloc(&d_dEdb, outF * sizeof(float));
+
+    int blockSize = 256;
+    int gridSize = (outF + blockSize - 1) / blockSize;
+    __CU_ComputeBiasGradient<<<gridSize, blockSize>>>(d_dEdb, dEdx_device, batchSize, outF);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(dEdb_host, d_dEdb, outF * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_dEdb);
+}
+#define CUDA_CHECK(x)                                                                        \
+    do                                                                                       \
+    {                                                                                        \
+        cudaError_t err = x;                                                                 \
+        if (err != cudaSuccess)                                                              \
+        {                                                                                    \
+            printf("CUDA error %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(1);                                                                         \
+        }                                                                                    \
+    } while (0)
+
+void CU_BackpropagateLayer(
+    float *W, float *b,
+    const float *X, const float *z,
+    const float *current_dEdy,
+    float *new_dEdy,
+    int batchSize, int inF, int outF,
+    float *dEdW, float *dEdb,
+    float learningRate, float clipValue,
+    bool apply_relu)
+{
+    int totalOut = batchSize * outF;
+    int totalIn = batchSize * inF;
+
+    float *d_X, *d_XT, *d_z, *d_current_dEdy, *d_dEdx;
+    float *d_W, *d_WT, *d_new_dEdy, *d_dEdW, *d_dEdb, *d_b;
+
+    CUDA_CHECK(cudaMalloc(&d_X, totalIn * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_XT, totalIn * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_z, totalOut * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_current_dEdy, totalOut * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dEdx, totalOut * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_W, inF * outF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_WT, inF * outF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_new_dEdy, batchSize * inF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dEdW, inF * outF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dEdb, outF * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_b, outF * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_X, X, totalIn * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_z, z, totalOut * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_current_dEdy, current_dEdy, totalOut * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W, W, inF * outF * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, b, outF * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Compute dEdx = current_dEdy * dReLU/dz (if relu)
+    int blockSize = 256;
+    int gridSize = (totalOut + blockSize - 1) / blockSize;
+    __CU_Compute_dEdx<<<gridSize, blockSize>>>(d_dEdx, d_current_dEdy, d_z, totalOut, apply_relu);
+
+    // Transpose X -> XT
+    dim3 dimBlock(16, 16);
+    dim3 dimGrid((inF + 15) / 16, (batchSize + 15) / 16);
+    __CU_Transpose<<<dimGrid, dimBlock>>>(d_XT, d_X, batchSize, inF);
+
+    // Compute dEdW = XT @ dEdx
+    dim3 gridMatmul((outF + 15) / 16, (inF + 15) / 16);
+    dim3 blockMatmul(16, 16);
+    __CU_MatmulBatch<<<gridMatmul, blockMatmul>>>(d_dEdW, d_XT, d_dEdx, inF, batchSize, outF);
+
+    // Clip gradients
+    // Clip gradients
+    CU_ClipGradientValue(d_dEdW, inF * outF, clipValue);
+
+    // Compute dEdb = average over batch of dEdx
+    __CU_ComputeBiasGradient<<<(outF + 255) / 256, 256>>>(d_dEdb, d_dEdx, batchSize, outF);
+
+    // Update weights and bias
+    __CU_UpdateParameter<<<(inF * outF + 255) / 256, 256>>>(d_W, d_dEdW, learningRate, inF * outF);
+    __CU_UpdateParameter<<<(outF + 255) / 256, 256>>>(d_b, d_dEdb, learningRate, outF);
+
+    // Transpose W -> WT
+    __CU_Transpose<<<dim3((inF + 15) / 16, (outF + 15) / 16), dim3(16, 16)>>>(d_WT, d_W, inF, outF);
+
+    // Compute new_dEdy = dEdx @ WT
+    __CU_MatmulBatch<<<dim3((inF + 15) / 16, (batchSize + 15) / 16), dim3(16, 16)>>>(d_new_dEdy, d_dEdx, d_WT, batchSize, outF, inF);
+
+    // Copy results back to host
+    CUDA_CHECK(cudaMemcpy(W, d_W, inF * outF * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b, d_b, outF * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(new_dEdy, d_new_dEdy, batchSize * inF * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dEdW, d_dEdW, inF * outF * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dEdb, d_dEdb, outF * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Cleanup
+    cudaFree(d_X);
+    cudaFree(d_XT);
+    cudaFree(d_z);
+    cudaFree(d_current_dEdy);
+    cudaFree(d_dEdx);
+    cudaFree(d_W);
+    cudaFree(d_WT);
+    cudaFree(d_new_dEdy);
+    cudaFree(d_dEdW);
+    cudaFree(d_dEdb);
+    cudaFree(d_b);
+}
+
 void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int batchSize, float learningRate)
 {
     float *current_dEdy = dEdy;
@@ -560,36 +815,26 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         float *new_dEdy = (float *)malloc(batchSize * inF * sizeof(float));
         // Clip value/the maximum of a gradient value can reach
         float clipValue = 0.5;
-
-        for (int i = 0; i < batchSize * outF; i++)
-        {
-            dydx[i] = (layer < numLayers - 1) ? D_ReLu(z[i]) : 1.0f;
-            dEdx[i] = current_dEdy[i] * dydx[i];
-        }
-
         if (gpuInference)
         {
-            CU_Transpose(XT, X, batchSize, inF);
-            // Weight update value
-            // dEdx @ self.W.T
-            CU_MatmulBatch(dEdW, XT, dEdx, inF, batchSize, outF);
-            ClipGradientValue(dEdW, inF * outF, clipValue);
-            // Bias update value
-            for (int j = 0; j < outF; j++)
-            {
-                dEdb[j] = 0.0f;
-                for (int b = 0; b < batchSize; b++)
-                {
-                    dEdb[j] += dEdx[b * outF + j];
-                }
-            }
-            CU_UpdateParameter(W, dEdW, learningRate, inF, outF);
-            CU_UpdateParameter(b, dEdb, learningRate, outF, 1);
-            CU_Transpose(WT, W, inF, outF);
-            CU_MatmulBatch(new_dEdy, dEdx, WT, batchSize, outF, inF);
+            CU_BackpropagateLayer(
+                W, b,
+                X, z,
+                current_dEdy,
+                new_dEdy,
+                batchSize, inF, outF,
+                dEdW, dEdb,
+                learningRate, clipValue,
+                true);
         }
         else
         {
+
+            for (int i = 0; i < batchSize * outF; i++)
+            {
+                dydx[i] = (layer < numLayers - 1) ? D_ReLu(z[i]) : 1.0f;
+                dEdx[i] = current_dEdy[i] * dydx[i];
+            }
             Transpose(XT, X, batchSize, inF);
             // dEdx @ self.W.T
             MatmulBatch(dEdW, XT, dEdx, inF, batchSize, outF);
@@ -666,13 +911,6 @@ void PredictSingle(int inputIndex, struct Layer *layerSequence, int numLayers, f
     SoftMaxBatch(logitsSingle, 1, layerSequence[numLayers - 1].outFeature);
     printf("=======================\n");
     printf("Predicted probabilities:\n");
-    // printf("Porbabilities");
-    // for (int i = 0; i < numClasses; i++)
-    // {
-    //     printf("x%.4f ", i, logitsSingle[i]);
-    // }
-    // printf("\n");
-
     int predictedClass = 0;
     float maxProb = logitsSingle[0];
     for (int i = 1; i < numClasses; i++)
@@ -702,12 +940,92 @@ void PredictSingle(int inputIndex, struct Layer *layerSequence, int numLayers, f
     free(logitsSingle);
 }
 
-void Train(struct Layer layer, int epoch)
+__global__ void softmax_kernel(float *x, int batch_size, int size)
 {
-    for (int i = 0; i < epoch; i++)
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batch_size)
     {
-        printf("Epoch %d, Loss: nan, Acc: nan\n", epoch);
+        float max_val = x[b * size];
+        for (int i = 1; i < size; ++i)
+        {
+            max_val = fmaxf(max_val, x[b * size + i]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < size; ++i)
+        {
+            x[b * size + i] = expf(x[b * size + i] - max_val);
+            sum += x[b * size + i];
+        }
+
+        for (int i = 0; i < size; ++i)
+        {
+            x[b * size + i] = fmaxf(x[b * size + i] / sum, 1e-7f); // clamp to avoid log(0)
+        }
     }
+}
+
+void CU_SoftMaxBatch(float *host_logits, int batchSize, int numClasses)
+{
+    int total = batchSize * numClasses;
+    float *device_logits;
+
+    // Allocate device memory
+    CUDA_CHECK(cudaMalloc(&device_logits, total * sizeof(float)));
+
+    // Copy input logits from host to device
+    CUDA_CHECK(cudaMemcpy(device_logits, host_logits, total * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch kernel
+    int threads = 128;
+    int blocks = (batchSize + threads - 1) / threads;
+    softmax_kernel<<<blocks, threads>>>(device_logits, batchSize, numClasses);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(host_logits, device_logits, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CUDA_CHECK(cudaFree(device_logits));
+}
+
+__global__ void __CU_CrossEntropyGradient(float *dEdy, const float *logits, const float *y_batch, int total, int batchSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total)
+    {
+        dEdy[idx] = (logits[idx] - y_batch[idx]) / batchSize;
+    }
+}
+
+void CU_CrossEntropyGradient(float *dEdy_host, const float *logits_host, const float *y_batch_host, int batchSize, int numClasses)
+{
+    int total = batchSize * numClasses;
+    float *d_logits, *d_y_batch, *d_dEdy;
+
+    // Allocate memory
+    CUDA_CHECK(cudaMalloc(&d_logits, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_y_batch, total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dEdy, total * sizeof(float)));
+
+    // Copy inputs to device
+    CUDA_CHECK(cudaMemcpy(d_logits, logits_host, total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_y_batch, y_batch_host, total * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch kernel
+    int blockSize = 256;
+    int gridSize = (total + blockSize - 1) / blockSize;
+    __CU_CrossEntropyGradient<<<gridSize, blockSize>>>(d_dEdy, d_logits, d_y_batch, total, batchSize);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy result back
+    CUDA_CHECK(cudaMemcpy(dEdy_host, d_dEdy, total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    cudaFree(d_logits);
+    cudaFree(d_y_batch);
+    cudaFree(d_dEdy);
 }
 
 int main(int argc, char const *argv[])
@@ -796,42 +1114,48 @@ int main(int argc, char const *argv[])
         InitWeights(&layerSequence[i]);
         InitBias(&layerSequence[i]);
     }
-
-    float loss = 0;
     int numClasses = 10;
-    int batchSize = 10000;
-    // Initialize buffer
-    float *logits = (float *)calloc(numClasses * batchSize, sizeof(float));
+    int totalSamples = 10000;
+    int epoch_count = 20;
+    int batchSize = 32;
+    int batchCount = totalSamples / batchSize;
+
+    // Allocate buffers for logits and output gradient
+    float *logits = (float *)calloc(batchSize * numClasses, sizeof(float));
     float *dEdy = (float *)calloc(batchSize * numClasses, sizeof(float));
 
-    clock_t t;
-    t = clock();
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
-    int epoch_count = 100;
-    for (int i = 0; i < epoch_count; i++)
+    for (int epoch = 0; epoch < epoch_count; epoch++)
     {
-        // Calculate initial prediction
-        ForwardProp(logits, layerSequence, numLayers, X, batchSize);
-        // Use Softmax to get probabilities of each class
-        SoftMaxBatch(logits, batchSize, layerSequence[numLayers - 1].outFeature);
-        // Calculate Output gradient
-        // Since this is full batch gradient descent, divide by the batchSize
-        for (int j = 0; j < batchSize * numClasses; j++)
+        double totalLoss = 0.0;
+
+        for (int b = 0; b < batchCount; b++)
         {
-            dEdy[j] = (logits[j] - y[j]) / batchSize;
+            float *X_batch = &X[b * batchSize * 784];
+            float *y_batch = &y[b * batchSize * numClasses];
+
+            ForwardProp(logits, layerSequence, numLayers, X_batch, batchSize);
+            CU_SoftMaxBatch(logits, batchSize, numClasses);
+            CU_CrossEntropyGradient(dEdy, logits, y_batch, batchSize, numClasses);
+
+            totalLoss += CalculateCCELoss(logits, y_batch, batchSize, numClasses);
+            BackwardProp(layerSequence, dEdy, numLayers, batchSize, 0.05f);
         }
-        // Calculate Cross Entropy Loss
-        loss = CalculateCCELoss(logits, y, batchSize, numClasses);
-        printf("epoch #%d, loss: %lf\n", i + 1, loss);
-        // Using Output Gradient and backpropagation, update parameters
-        BackwardProp(layerSequence, dEdy, numLayers, batchSize, 0.1);
+
+        printf("Epoch #%d, Avg Loss: %.6f\n", epoch + 1, totalLoss / batchCount);
     }
 
-    t = clock() - t;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    // Calculate duration in seconds with milliseconds
+    double training_time = (end.tv_sec - start.tv_sec) +
+                           (end.tv_nsec - start.tv_nsec) / 1e9;
 
     // Print predictions and check learning result
     PredictSingle(1250, layerSequence, numLayers, X, labels, numClasses);
-    PredictSingle(4700, layerSequence, numLayers, X, labels, numClasses);
+    PredictSingle(49000, layerSequence, numLayers, X, labels, numClasses);
     PredictSingle(2512, layerSequence, numLayers, X, labels, numClasses);
 
     // Free memory
@@ -842,9 +1166,7 @@ int main(int argc, char const *argv[])
     free(normalizedImg);
     free(onehotLabels);
 
-    // Calculate time taken by the training
-    double time_taken = ((double)t) / CLOCKS_PER_SEC;
-    printf("log: it took %.2lf seconds to execute %d epochs\n", time_taken, epoch_count);
+    printf("\nTotal training time: %.2f sec\n", training_time);
     printf("=====program end=====\n");
     return 0;
 }
