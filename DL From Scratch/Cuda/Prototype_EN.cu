@@ -550,7 +550,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         float *X = layerSequence[layer].X;
         float *z = layerSequence[layer].z;
         float *dydx = (float *)calloc(batchSize * outF, sizeof(float));
-        float *dEdx = (float *)calloc(batchSize * outF, sizeof(float));
+        float *dEdz = (float *)calloc(batchSize * outF, sizeof(float));
         float *dEdW = (float *)calloc(inF * outF, sizeof(float));
         float *dEdb = (float *)calloc(outF, sizeof(float));
         // X is [inF x batchSize], XT is [batchSize x inF]
@@ -564,15 +564,15 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         for (int i = 0; i < batchSize * outF; i++)
         {
             dydx[i] = (layer < numLayers - 1) ? D_ReLu(z[i]) : 1.0f;
-            dEdx[i] = current_dEdy[i] * dydx[i];
+            dEdz[i] = current_dEdy[i] * dydx[i];
         }
 
         if (gpuInference)
         {
             CU_Transpose(XT, X, batchSize, inF);
             // Weight update value
-            // dEdx @ self.W.T
-            CU_MatmulBatch(dEdW, XT, dEdx, inF, batchSize, outF);
+            // dEdz @ self.W.T
+            CU_MatmulBatch(dEdW, XT, dEdz, inF, batchSize, outF);
             ClipGradientValue(dEdW, inF * outF, clipValue);
             // Bias update value
             for (int j = 0; j < outF; j++)
@@ -580,28 +580,28 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
                 dEdb[j] = 0.0f;
                 for (int b = 0; b < batchSize; b++)
                 {
-                    dEdb[j] += dEdx[b * outF + j];
+                    dEdb[j] += dEdz[b * outF + j];
                 }
             }
             CU_UpdateParameter(W, dEdW, learningRate, inF, outF);
             CU_UpdateParameter(b, dEdb, learningRate, outF, 1);
             CU_Transpose(WT, W, inF, outF);
-            CU_MatmulBatch(new_dEdy, dEdx, WT, batchSize, outF, inF);
+            CU_MatmulBatch(new_dEdy, dEdz, WT, batchSize, outF, inF);
         }
         else
         {
             Transpose(XT, X, batchSize, inF);
-            // dEdx @ self.W.T
-            MatmulBatch(dEdW, XT, dEdx, inF, batchSize, outF);
+            // dEdz @ self.W.T
+            MatmulBatch(dEdW, XT, dEdz, inF, batchSize, outF);
             ClipGradientValue(dEdW, inF * outF, clipValue);
             // printf("layer %d: %.2lf, %.2lf, %.2lf\n", layer, X[0], W[0], z[0]);
-            // printf("layer %d deriv: %.2lf, %.2lf, %.2lf\n", layer, dEdx[0], dEdW[0], current_dEdy[0]);
+            // printf("layer %d deriv: %.2lf, %.2lf, %.2lf\n", layer, dEdz[0], dEdW[0], current_dEdy[0]);
             for (int j = 0; j < outF; j++)
             {
                 dEdb[j] = 0.0f;
                 for (int b = 0; b < batchSize; b++)
                 {
-                    dEdb[j] += dEdx[b * outF + j];
+                    dEdb[j] += dEdz[b * outF + j];
                 }
             }
             for (int i = 0; i < inF * outF; i++)
@@ -613,7 +613,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
                 b[j] -= learningRate * dEdb[j];
             }
             Transpose(WT, W, inF, outF);
-            MatmulBatch(new_dEdy, dEdx, WT, batchSize, outF, inF);
+            MatmulBatch(new_dEdy, dEdz, WT, batchSize, outF, inF);
         }
 
         if (layer != numLayers - 1)
@@ -626,7 +626,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         free(XT);
         free(WT);
         free(dydx);
-        free(dEdx);
+        free(dEdz);
         free(dEdW);
         free(dEdb);
     }

@@ -522,24 +522,24 @@ void CU_ClipGradientValue(float *grad, int size, float threshold)
     free(h_partialSum);
 }
 
-__global__ void __CU_Compute_dEdx(float *dEdx, const float *current_dEdy, const float *z, int size, bool apply_relu)
+__global__ void __CU_Compute_dEdz(float *dEdz, const float *current_dEdy, const float *z, int size, bool apply_relu)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size)
     {
         float dydx = apply_relu ? (z[i] > 0.0f ? 1.0f : 0.0f) : 1.0f;
-        dEdx[i] = current_dEdy[i] * dydx;
+        dEdz[i] = current_dEdy[i] * dydx;
     }
 }
 
-void CU_Compute_dEdx(float *dEdx_host, const float *current_dEdy_host, const float *z_host, int batchSize, int outF, bool apply_relu)
+void CU_Compute_dEdz(float *dEdz_host, const float *current_dEdy_host, const float *z_host, int batchSize, int outF, bool apply_relu)
 {
     int size = batchSize * outF;
     size_t bytes = size * sizeof(float);
 
     // Allocate device memory
-    float *d_dEdx, *d_current_dEdy, *d_z;
-    cudaMalloc(&d_dEdx, bytes);
+    float *d_dEdz, *d_current_dEdy, *d_z;
+    cudaMalloc(&d_dEdz, bytes);
     cudaMalloc(&d_current_dEdy, bytes);
     cudaMalloc(&d_z, bytes);
 
@@ -550,14 +550,14 @@ void CU_Compute_dEdx(float *dEdx_host, const float *current_dEdy_host, const flo
     // Launch kernel
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
-    __CU_Compute_dEdx<<<gridSize, blockSize>>>(d_dEdx, d_current_dEdy, d_z, size, apply_relu);
+    __CU_Compute_dEdz<<<gridSize, blockSize>>>(d_dEdz, d_current_dEdy, d_z, size, apply_relu);
     cudaDeviceSynchronize();
 
     // Copy result back to host
-    cudaMemcpy(dEdx_host, d_dEdx, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(dEdz_host, d_dEdz, bytes, cudaMemcpyDeviceToHost);
 
     // Free device memory
-    cudaFree(d_dEdx);
+    cudaFree(d_dEdz);
     cudaFree(d_current_dEdy);
     cudaFree(d_z);
 }
@@ -667,7 +667,7 @@ void ClipGradientValue(float *grad, int size, float threshold)
     }
 }
 
-__global__ void __CU_ComputeBiasGradient(float *dEdb, const float *dEdx, int batchSize, int outF)
+__global__ void __CU_ComputeBiasGradient(float *dEdb, const float *dEdz, int batchSize, int outF)
 {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j < outF)
@@ -675,20 +675,20 @@ __global__ void __CU_ComputeBiasGradient(float *dEdb, const float *dEdx, int bat
         float sum = 0.0f;
         for (int b = 0; b < batchSize; b++)
         {
-            sum += dEdx[b * outF + j];
+            sum += dEdz[b * outF + j];
         }
         dEdb[j] = sum;
     }
 }
 
-void CU_ComputeBiasGradient(float *dEdb_host, const float *dEdx_device, int batchSize, int outF)
+void CU_ComputeBiasGradient(float *dEdb_host, const float *dEdz_device, int batchSize, int outF)
 {
     float *d_dEdb;
     cudaMalloc(&d_dEdb, outF * sizeof(float));
 
     int blockSize = 256;
     int gridSize = (outF + blockSize - 1) / blockSize;
-    __CU_ComputeBiasGradient<<<gridSize, blockSize>>>(d_dEdb, dEdx_device, batchSize, outF);
+    __CU_ComputeBiasGradient<<<gridSize, blockSize>>>(d_dEdb, dEdz_device, batchSize, outF);
     cudaDeviceSynchronize();
 
     cudaMemcpy(dEdb_host, d_dEdb, outF * sizeof(float), cudaMemcpyDeviceToHost);
@@ -718,14 +718,14 @@ void CU_BackpropagateLayer(
     int totalOut = batchSize * outF;
     int totalIn = batchSize * inF;
 
-    float *d_X, *d_XT, *d_z, *d_current_dEdy, *d_dEdx;
+    float *d_X, *d_XT, *d_z, *d_current_dEdy, *d_dEdz;
     float *d_W, *d_WT, *d_new_dEdy, *d_dEdW, *d_dEdb, *d_b;
 
     CUDA_CHECK(cudaMalloc(&d_X, totalIn * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_XT, totalIn * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_z, totalOut * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_current_dEdy, totalOut * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dEdx, totalOut * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dEdz, totalOut * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_W, inF * outF * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_WT, inF * outF * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_new_dEdy, batchSize * inF * sizeof(float)));
@@ -739,27 +739,27 @@ void CU_BackpropagateLayer(
     CUDA_CHECK(cudaMemcpy(d_W, W, inF * outF * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b, b, outF * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Compute dEdx = current_dEdy * dReLU/dz (if relu)
+    // Compute dEdz = current_dEdy * dReLU/dz (if relu)
     int blockSize = 256;
     int gridSize = (totalOut + blockSize - 1) / blockSize;
-    __CU_Compute_dEdx<<<gridSize, blockSize>>>(d_dEdx, d_current_dEdy, d_z, totalOut, apply_relu);
+    __CU_Compute_dEdz<<<gridSize, blockSize>>>(d_dEdz, d_current_dEdy, d_z, totalOut, apply_relu);
 
     // Transpose X -> XT
     dim3 dimBlock(16, 16);
     dim3 dimGrid((inF + 15) / 16, (batchSize + 15) / 16);
     __CU_Transpose<<<dimGrid, dimBlock>>>(d_XT, d_X, batchSize, inF);
 
-    // Compute dEdW = XT @ dEdx
+    // Compute dEdW = XT @ dEdz
     dim3 gridMatmul((outF + 15) / 16, (inF + 15) / 16);
     dim3 blockMatmul(16, 16);
-    __CU_MatmulBatch<<<gridMatmul, blockMatmul>>>(d_dEdW, d_XT, d_dEdx, inF, batchSize, outF);
+    __CU_MatmulBatch<<<gridMatmul, blockMatmul>>>(d_dEdW, d_XT, d_dEdz, inF, batchSize, outF);
 
     // Clip gradients
     // Clip gradients
     CU_ClipGradientValue(d_dEdW, inF * outF, clipValue);
 
-    // Compute dEdb = average over batch of dEdx
-    __CU_ComputeBiasGradient<<<(outF + 255) / 256, 256>>>(d_dEdb, d_dEdx, batchSize, outF);
+    // Compute dEdb = average over batch of dEdz
+    __CU_ComputeBiasGradient<<<(outF + 255) / 256, 256>>>(d_dEdb, d_dEdz, batchSize, outF);
 
     // Update weights and bias
     __CU_UpdateParameter<<<(inF * outF + 255) / 256, 256>>>(d_W, d_dEdW, learningRate, inF * outF);
@@ -768,8 +768,8 @@ void CU_BackpropagateLayer(
     // Transpose W -> WT
     __CU_Transpose<<<dim3((inF + 15) / 16, (outF + 15) / 16), dim3(16, 16)>>>(d_WT, d_W, inF, outF);
 
-    // Compute new_dEdy = dEdx @ WT
-    __CU_MatmulBatch<<<dim3((inF + 15) / 16, (batchSize + 15) / 16), dim3(16, 16)>>>(d_new_dEdy, d_dEdx, d_WT, batchSize, outF, inF);
+    // Compute new_dEdy = dEdz @ WT
+    __CU_MatmulBatch<<<dim3((inF + 15) / 16, (batchSize + 15) / 16), dim3(16, 16)>>>(d_new_dEdy, d_dEdz, d_WT, batchSize, outF, inF);
 
     // Copy results back to host
     CUDA_CHECK(cudaMemcpy(W, d_W, inF * outF * sizeof(float), cudaMemcpyDeviceToHost));
@@ -783,7 +783,7 @@ void CU_BackpropagateLayer(
     cudaFree(d_XT);
     cudaFree(d_z);
     cudaFree(d_current_dEdy);
-    cudaFree(d_dEdx);
+    cudaFree(d_dEdz);
     cudaFree(d_W);
     cudaFree(d_WT);
     cudaFree(d_new_dEdy);
@@ -805,7 +805,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         float *X = layerSequence[layer].X;
         float *z = layerSequence[layer].z;
         float *dydx = (float *)calloc(batchSize * outF, sizeof(float));
-        float *dEdx = (float *)calloc(batchSize * outF, sizeof(float));
+        float *dEdz = (float *)calloc(batchSize * outF, sizeof(float));
         float *dEdW = (float *)calloc(inF * outF, sizeof(float));
         float *dEdb = (float *)calloc(outF, sizeof(float));
         // X is [inF x batchSize], XT is [batchSize x inF]
@@ -833,20 +833,20 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
             for (int i = 0; i < batchSize * outF; i++)
             {
                 dydx[i] = (layer < numLayers - 1) ? D_ReLu(z[i]) : 1.0f;
-                dEdx[i] = current_dEdy[i] * dydx[i];
+                dEdz[i] = current_dEdy[i] * dydx[i];
             }
             Transpose(XT, X, batchSize, inF);
-            // dEdx @ self.W.T
-            MatmulBatch(dEdW, XT, dEdx, inF, batchSize, outF);
+            // dEdz @ self.W.T
+            MatmulBatch(dEdW, XT, dEdz, inF, batchSize, outF);
             ClipGradientValue(dEdW, inF * outF, clipValue);
             // printf("layer %d: %.2lf, %.2lf, %.2lf\n", layer, X[0], W[0], z[0]);
-            // printf("layer %d deriv: %.2lf, %.2lf, %.2lf\n", layer, dEdx[0], dEdW[0], current_dEdy[0]);
+            // printf("layer %d deriv: %.2lf, %.2lf, %.2lf\n", layer, dEdz[0], dEdW[0], current_dEdy[0]);
             for (int j = 0; j < outF; j++)
             {
                 dEdb[j] = 0.0f;
                 for (int b = 0; b < batchSize; b++)
                 {
-                    dEdb[j] += dEdx[b * outF + j];
+                    dEdb[j] += dEdz[b * outF + j];
                 }
             }
             for (int i = 0; i < inF * outF; i++)
@@ -858,7 +858,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
                 b[j] -= learningRate * dEdb[j];
             }
             Transpose(WT, W, inF, outF);
-            MatmulBatch(new_dEdy, dEdx, WT, batchSize, outF, inF);
+            MatmulBatch(new_dEdy, dEdz, WT, batchSize, outF, inF);
         }
 
         if (layer != numLayers - 1)
@@ -871,7 +871,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         free(XT);
         free(WT);
         free(dydx);
-        free(dEdx);
+        free(dEdz);
         free(dEdW);
         free(dEdb);
     }

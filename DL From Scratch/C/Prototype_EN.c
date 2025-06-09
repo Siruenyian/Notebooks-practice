@@ -316,6 +316,7 @@ void clip_gradient(float *grad, int size, float threshold)
 void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int batchSize, float learningRate)
 {
     float *current_dEdy = dEdy;
+    printf("%lf\n", dEdy[12]);
 
     for (int layer = numLayers - 1; layer >= 0; layer--)
     {
@@ -324,24 +325,26 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         float *W = layerSequence[layer].Weight;
         float *X = layerSequence[layer].X;
         float *z = layerSequence[layer].z;
-        float *dydx = calloc(batchSize * outF, sizeof(float));
-        float *dEdx = calloc(batchSize * outF, sizeof(float));
+        float *dydz = calloc(batchSize * outF, sizeof(float));
+        float *dEdz = calloc(batchSize * outF, sizeof(float));
         float *dEdW = calloc(inF * outF, sizeof(float));
         float *dEdb = calloc(outF, sizeof(float));
 
         for (int i = 0; i < batchSize * outF; i++)
         {
-            dydx[i] = (layer < numLayers - 1) ? relu_derivative(z[i]) : 1.0f;
-            dEdx[i] = current_dEdy[i] * dydx[i];
+            dydz[i] = (layer < numLayers - 1) ? relu_derivative(z[i]) : 1.0f;
+            dEdz[i] = current_dEdy[i] * dydz[i];
         }
 
         float *XT = malloc(inF * batchSize * sizeof(float));
         transpose(XT, X, batchSize, inF);
-        matmul_batch(dEdW, XT, dEdx, inF, batchSize, outF);
+        matmul_batch(dEdW, XT, dEdz, inF, batchSize, outF);
         free(XT);
+        printf("layer %d: %.2lf, %.2lf, %.2lf\n", layer, X[0], W[0], z[0]);
+        printf("layer %d deriv: %.2lf, %.2lf, %.2lf\n", layer, dEdz[0], dEdW[0], current_dEdy[0]);
 
         // gradient clip = 5
-        clip_gradient(dEdW, inF * outF, 0.5f);
+        // clip_gradient(dEdW, inF * outF, 0.5f);
 
         // Weight update
         for (int i = 0; i < inF * outF; i++)
@@ -354,7 +357,7 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
             dEdb[j] = 0.0f;
             for (int b = 0; b < batchSize; b++)
             {
-                dEdb[j] += dEdx[b * outF + j];
+                dEdb[j] += dEdz[b * outF + j];
             }
         }
 
@@ -364,12 +367,12 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
             layerSequence[layer].Bias[j] -= learningRate * dEdb[j];
         }
 
-        // dEdx @ self.W.T
+        // dEdz @ self.W.T
         float *WT = malloc(outF * inF * sizeof(float));
         transpose(WT, W, inF, outF);
         // W is [inF x outF], WT is [outF x inF]
         float *new_dEdy = malloc(batchSize * inF * sizeof(float));
-        matmul_batch(new_dEdy, dEdx, WT, batchSize, outF, inF);
+        matmul_batch(new_dEdy, dEdz, WT, batchSize, outF, inF);
         free(WT);
 
         if (layer != numLayers - 1)
@@ -379,8 +382,8 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
 
         current_dEdy = new_dEdy;
 
-        free(dydx);
-        free(dEdx);
+        free(dydz);
+        free(dEdz);
         free(dEdW);
         free(dEdb);
     }
