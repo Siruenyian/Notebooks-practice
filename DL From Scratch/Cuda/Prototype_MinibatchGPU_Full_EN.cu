@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+
+// Loop to echeck Cuda availability
 #define CUDA_CHECK(x)                                                                        \
     do                                                                                       \
     {                                                                                        \
@@ -21,11 +23,8 @@
             exit(1);                                                                         \
         }                                                                                    \
     } while (0)
-// Global Variable to set GPU Acceleration
-// Initialized as False, do not change this
-// Change the one on the main fcuntion instead
-bool gpuInference = false;
 
+// Fucntion to print Cuda Array on device
 void CopyAndPrintDeviceArray(const float *device_array, int batchSize, int numClasses, const char *label)
 {
     int total = batchSize * numClasses;
@@ -129,6 +128,27 @@ unsigned char *LoadMnistLabels(const char *path, int *number_of_labels)
     return labels;
 }
 
+// Normalizes array value to 0.0 - 1.0
+void Normalize(float *normalizedImg, unsigned char *images, int len)
+{
+    for (int i = 0; i < len; i++)
+    {
+        normalizedImg[i] = images[i] / 255.0f;
+    }
+}
+
+// Encodes a class label to one-hot vector
+void OneHotEncode(float *onehotLabels, unsigned char *labels, int len, int numClasses)
+{
+    for (int i = 0; i < len; i++)
+    {
+        for (int j = 0; j < numClasses; j++)
+        {
+            onehotLabels[i * numClasses + j] = (labels[i] == j) ? 1.0f : 0.0f;
+        }
+    }
+}
+
 // ReLU function
 float ReLU(float x)
 {
@@ -145,38 +165,6 @@ float D_ReLu(float x)
 float Sigmoid(float x)
 {
     return 1.0f / (1.0f + expf(-x));
-}
-
-// Softmax Function
-// modified to accept batches
-void SoftMaxBatch(float *x, int batchSize, int size)
-{
-    for (int b = 0; b < batchSize; ++b)
-    {
-        float *row = &x[b * size];
-
-        // Step 1: find max for numerical stability
-        float max_val = row[0];
-        for (int i = 1; i < size; i++)
-        {
-            if (row[i] > max_val)
-                max_val = row[i];
-        }
-
-        // Step 2: exponentiate and sum
-        float sum = 0.0f;
-        for (int i = 0; i < size; i++)
-        {
-            row[i] = expf(row[i] - max_val);
-            sum += row[i];
-        }
-
-        // Step 3: normalize
-        for (int i = 0; i < size; i++)
-        {
-            row[i] /= sum;
-        }
-    }
 }
 
 // TODO: Implement quick switching of activation fucntion
@@ -200,48 +188,8 @@ struct Layer
     ActivationType activation;
 };
 
-// Returns a random floating point(decimal) value
-float randFloat()
-{
-    return ((float)rand()) / RAND_MAX;
-}
-
-// A: [M x K] - input matrix 1
-// B: [K x N] - input matrix 2
-// C: [M x N] - output
-void MatmulBatch(float *C, float *A, float *B, int M, int K, int N)
-{
-    for (int m = 0; m < M; ++m)
-    {
-        float *a = &A[m * K];
-        float *c = &C[m * N];
-
-        for (int n = 0; n < N; ++n)
-        {
-            float val = 0.0f;
-            for (int k = 0; k < K; ++k)
-            {
-                val += B[k * N + n] * a[k];
-            }
-            c[n] = val;
-        }
-    }
-}
-
-// A: [M x K] - input matrix
-// B: [K x M] - output matrix
-void Transpose(float *B, const float *A, int rows, int cols)
-{
-    for (int i = 0; i < rows; ++i)
-    {
-        for (int j = 0; j < cols; ++j)
-        {
-            // B[j][i] = A[i][j]
-            B[j * rows + i] = A[i * cols + j];
-        }
-    }
-}
-
+// Weight initialize function
+// It sets the weight array to rand/max * sqroot(size) - (sqroot(size)/2)
 void InitWeights(Layer *layer)
 {
     int in = layer->inFeature;
@@ -259,6 +207,8 @@ void InitWeights(Layer *layer)
     free(h_weights);
 }
 
+// Bias initialize function
+// Sets the bias array to zeros
 void InitBias(struct Layer *layer)
 {
     int out = layer->outFeature;
@@ -302,7 +252,8 @@ float CalculateCCELoss(float *yPred, float *yTrue, int batchSize, int numClasses
 
 // ==========CUDA Accelerated Functions and Kernels==========
 
-__global__ void CU_init_random(float *data, int size, unsigned long long seed)
+// Kernel to intialize random array value
+__global__ void __CU_init_random(float *data, int size, unsigned long long seed)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size)
@@ -313,7 +264,18 @@ __global__ void CU_init_random(float *data, int size, unsigned long long seed)
     }
 }
 
-__global__ void CU_relu_derivative(float *grad, float *x, int size)
+// Kernel to calculate the ReLU function
+__global__ void __CU_ReLU(float *data, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size)
+    {
+        data[idx] = fmaxf(data[idx], 0.0f);
+    }
+}
+
+// Kernel to calculate the derivative of the ReLU function
+__global__ void __CU_relu_derivative(float *grad, float *x, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size)
@@ -321,6 +283,8 @@ __global__ void CU_relu_derivative(float *grad, float *x, int size)
         grad[idx] *= (x[idx] > 0) ? 1.0f : 0.0f;
     }
 }
+
+// Kernel for Matrix Multiplication
 // A: [M x K] - input matrix 1
 // B: [K x N] - input matrix 2
 // C: [M x N] - output matrix
@@ -344,51 +308,7 @@ __global__ void __CU_MatmulBatch(float *C, float *A, float *B, int M, int K, int
     }
 }
 
-__global__ void __CU_ReLU(float *data, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size)
-    {
-        data[idx] = fmaxf(data[idx], 0.0f);
-    }
-}
-
-// Cuda Matmul wrapper function
-void CU_MatmulBatch(float *C, float *A, float *B, int M, int K, int N)
-{
-    // Allocate Memory
-    float *d_A;
-    float *d_B;
-    float *d_C;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_B, K * N * sizeof(float));
-    cudaMalloc(&d_C, M * N * sizeof(float));
-    // Copy from CPU->GPU
-    cudaMemcpy(d_A, A, M * K * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, K * N * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Declare block and grid dimensions(parameters)
-    // Hierarchy: grid->block->thread
-    // remember: cuda grid is written as (col, row) so its x first
-    dim3 blockDim(16, 16);
-    dim3 gridDim((N + blockDim.x - 1) / blockDim.x,
-                 (M + blockDim.y - 1) / blockDim.y);
-
-    // Call cuda Kernel
-    __CU_MatmulBatch<<<gridDim, blockDim>>>(d_C, d_A, d_B, M, K, N);
-
-    // Wait Until all execution is finished
-    cudaDeviceSynchronize();
-
-    // Copy from GPU->CPU
-    cudaMemcpy(C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Free allocated memory
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-}
-
+// Kernel for Matrix Transpose
 // A: [M x K] - input matrix
 // B: [K x M] - output matrix
 __global__ void __CU_Transpose(float *B, const float *A, int M, int K)
@@ -403,29 +323,7 @@ __global__ void __CU_Transpose(float *B, const float *A, int M, int K)
     }
 }
 
-// Cuda Transpose wrapper function
-void CU_Transpose(float *B, const float *A, int M, int K)
-{
-    float *d_A;
-    // B is out
-    float *d_B;
-    cudaMalloc(&d_A, M * K * sizeof(float));
-    cudaMalloc(&d_B, M * K * sizeof(float));
-    cudaMemcpy(d_A, A, M * K * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, M * K * sizeof(float), cudaMemcpyHostToDevice);
-    dim3 blockDim(16, 16);
-    // remember: cuda grid is col, row, so its x first
-    dim3 gridDim((K + blockDim.x - 1) / blockDim.x,
-                 (M + blockDim.y - 1) / blockDim.y);
-    __CU_Transpose<<<gridDim, blockDim>>>(d_B, d_A, M, K);
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(B, d_B, M * K * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_A);
-    cudaFree(d_B);
-}
-
+// Kernel fot Matrix Addition
 // A: [M x N] - input matrix 1
 // B: [M X N] - input matrix 2
 // C: [M x N] - output matrix
@@ -440,34 +338,8 @@ __global__ void __CU_VecAdd(float *C, float *A, float *B, int M, int N)
     }
 }
 
-void CU_VecAdd(float *C, float *A, float *B, int M, int N)
-{
-    float *d_A;
-    float *d_B;
-    float *d_C;
-
-    cudaMalloc(&d_A, M * N * sizeof(float));
-    cudaMalloc(&d_B, N * sizeof(float));
-    cudaMalloc(&d_C, M * N * sizeof(float));
-
-    cudaMemcpy(d_A, A, M * N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B, N * sizeof(float), cudaMemcpyHostToDevice);
-    // grid->block->thread
-    // max
-    dim3 blockDim(16, 16);
-    dim3 gridDim((N + blockDim.x - 1) / blockDim.x,
-                 (M + blockDim.y - 1) / blockDim.y);
-
-    __CU_VecAdd<<<gridDim, blockDim>>>(d_C, d_A, d_B, M, N);
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-}
-
+// Unified Kernel for updating parameter
+// This implementation uses Gradient Descent
 __global__ void __CU_UpdateParameter(float *W, const float *dEdW, float learningRate, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -477,30 +349,8 @@ __global__ void __CU_UpdateParameter(float *W, const float *dEdW, float learning
     }
 }
 
-void CU_UpdateParameter(float *W, const float *dEdW, float learningRate, int M, int K)
-{
-    float *d_W, *d_dEdW;
-    int size = M * K;
-    cudaMalloc(&d_W, size * sizeof(float));
-    cudaMalloc(&d_dEdW, size * sizeof(float));
-
-    cudaMemcpy(d_W, W, size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dEdW, dEdW, size * sizeof(float), cudaMemcpyHostToDevice);
-
-    int blockSize = 256;
-    // just one grid
-    int gridSize = (size + blockSize - 1) / blockSize;
-
-    __CU_UpdateParameter<<<gridSize, blockSize>>>(d_W, d_dEdW, learningRate, size);
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(W, d_W, size * sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_W);
-    cudaFree(d_dEdW);
-}
-
-__global__ void ComputeSquaredSum(float *grad, float *partialSum, int size)
+// Utility Kernel to compute squared sum
+__global__ void __CU_ComputeSquaredSum(float *grad, float *partialSum, int size)
 {
     __shared__ float cache[256];
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -530,7 +380,8 @@ __global__ void ComputeSquaredSum(float *grad, float *partialSum, int size)
         partialSum[blockIdx.x] = cache[0];
 }
 
-__global__ void FinalReductionAndScale(float *partialSum, float *scale, int gridSize, float threshold)
+// Utility Kernel to scale a value
+__global__ void __CU_ReduceAndScale(float *partialSum, float *scale, int gridSize, float threshold)
 {
     float normSq = 0.0f;
     for (int i = 0; i < gridSize; ++i)
@@ -549,7 +400,8 @@ __global__ void FinalReductionAndScale(float *partialSum, float *scale, int grid
     }
 }
 
-__global__ void ScaleGradient(float *grad, int size, float *scale)
+// Kernel to scale a gradient by some scalar value
+__global__ void __CU_ScaleGradient(float *grad, int size, float *scale)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < size)
@@ -558,7 +410,8 @@ __global__ void ScaleGradient(float *grad, int size, float *scale)
     }
 }
 
-void CU_ClipGradientValue(float *grad, int size, float threshold)
+// Kernel to clip gradient value and keep it in a certain maximum range
+void __CU_ClipGradientValue(float *grad, int size, float threshold)
 {
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
@@ -567,20 +420,16 @@ void CU_ClipGradientValue(float *grad, int size, float threshold)
     CUDA_CHECK(cudaMalloc(&d_partialSum, gridSize * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_scale, sizeof(float)));
 
-    // Step 1: compute squared sum in blocks
-    ComputeSquaredSum<<<gridSize, blockSize>>>(grad, d_partialSum, size);
+    // compute squared sum in blocks->reduce->scale
+    __CU_ComputeSquaredSum<<<gridSize, blockSize>>>(grad, d_partialSum, size);
+    __CU_ReduceAndScale<<<1, 1>>>(d_partialSum, d_scale, gridSize, threshold);
+    __CU_ScaleGradient<<<gridSize, blockSize>>>(grad, size, d_scale);
 
-    // Step 2: final reduction and calculate scaling factor
-    FinalReductionAndScale<<<1, 1>>>(d_partialSum, d_scale, gridSize, threshold);
-
-    // Step 3: apply scaling if needed
-    ScaleGradient<<<gridSize, blockSize>>>(grad, size, d_scale);
-
-    // Cleanup
     cudaFree(d_partialSum);
     cudaFree(d_scale);
 }
 
+// Kernel to compute the passing gradient on each layer(dEdz)
 __global__ void __CU_Compute_dEdz(float *dEdz, const float *current_dEdy, const float *z, int size, bool apply_relu)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -591,59 +440,27 @@ __global__ void __CU_Compute_dEdz(float *dEdz, const float *current_dEdy, const 
     }
 }
 
-void CU_Compute_dEdz(float *dEdz_host, const float *current_dEdy_host, const float *z_host, int batchSize, int outF, bool apply_relu)
+// Kernel to compute the bias gradient value
+__global__ void __CU_ComputeBiasGradient(float *dEdb, const float *dEdz, int batchSize, int outF)
 {
-    int size = batchSize * outF;
-    size_t bytes = size * sizeof(float);
-
-    // Allocate device memory
-    float *d_dEdz, *d_current_dEdy, *d_z;
-    cudaMalloc(&d_dEdz, bytes);
-    cudaMalloc(&d_current_dEdy, bytes);
-    cudaMalloc(&d_z, bytes);
-
-    // Copy host data to device
-    cudaMemcpy(d_current_dEdy, current_dEdy_host, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_z, z_host, bytes, cudaMemcpyHostToDevice);
-
-    // Launch kernel
-    int blockSize = 256;
-    int gridSize = (size + blockSize - 1) / blockSize;
-    __CU_Compute_dEdz<<<gridSize, blockSize>>>(d_dEdz, d_current_dEdy, d_z, size, apply_relu);
-    cudaDeviceSynchronize();
-
-    // Copy result back to host
-    cudaMemcpy(dEdz_host, d_dEdz, bytes, cudaMemcpyDeviceToHost);
-
-    // Free device memory
-    cudaFree(d_dEdz);
-    cudaFree(d_current_dEdy);
-    cudaFree(d_z);
-}
-
-__global__ void CU_MatmulAddBiasKernel(
-    float *next,                       // [batchSize, outF]
-    const float *__restrict__ current, // [batchSize, inF]
-    const float *__restrict__ W,       // [inF, outF]
-    const float *__restrict__ bias,    // [outF]
-    int batchSize,
-    int inF,
-    int outF)
-{
-    int o = blockIdx.x * blockDim.x + threadIdx.x; // output feature index
-    int b = blockIdx.y * blockDim.y + threadIdx.y; // batch index
-
-    if (b < batchSize && o < outF)
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < outF)
     {
         float sum = 0.0f;
-        for (int i = 0; i < inF; ++i)
+        for (int b = 0; b < batchSize; b++)
         {
-            sum += current[b * inF + i] * W[i * outF + o];
+            sum += dEdz[b * outF + j];
         }
-        next[b * outF + o] = sum + bias[o];
+        dEdb[j] = sum;
     }
 }
 
+// Forward Propagation function
+// logits: raw softmax predition
+// layerSequence: struct of layers
+// numLayers: the number of layers present in the struct
+// input: truth data of the batch
+// batchSize: size of the batch that is processed
 void ForwardProp(float *logits, Layer *layerSequence, int numLayers, float *input, int batchSize)
 {
     // Find max feature size for buffer allocation
@@ -696,6 +513,7 @@ void ForwardProp(float *logits, Layer *layerSequence, int numLayers, float *inpu
             int blocksReLU = (size + threadsPerBlock - 1) / threadsPerBlock;
             __CU_ReLU<<<blocksReLU, threadsPerBlock>>>(next, size);
         }
+
         // Swap buffers for next layer input
         float *tmp = current;
         current = next;
@@ -708,34 +526,12 @@ void ForwardProp(float *logits, Layer *layerSequence, int numLayers, float *inpu
     cudaFree(temp1);
 }
 
-__global__ void __CU_ComputeBiasGradient(float *dEdb, const float *dEdz, int batchSize, int outF)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j < outF)
-    {
-        float sum = 0.0f;
-        for (int b = 0; b < batchSize; b++)
-        {
-            sum += dEdz[b * outF + j];
-        }
-        dEdb[j] = sum;
-    }
-}
-
-void CU_ComputeBiasGradient(float *dEdb_host, const float *dEdz_device, int batchSize, int outF)
-{
-    float *d_dEdb;
-    cudaMalloc(&d_dEdb, outF * sizeof(float));
-
-    int blockSize = 256;
-    int gridSize = (outF + blockSize - 1) / blockSize;
-    __CU_ComputeBiasGradient<<<gridSize, blockSize>>>(d_dEdb, dEdz_device, batchSize, outF);
-    // cudaDeviceSynchronize();
-
-    cudaMemcpy(dEdb_host, d_dEdb, outF * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_dEdb);
-}
-
+// Forward Propagation function
+// layerSequence: struct of layers
+// dEdy: The gradiet of the prediction and truth
+// numLayers: the number of layers present in the struct
+// batchSize: size of the batch that is processed
+// learningRate: value of the update step
 void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int batchSize, float learningRate)
 {
     // this is fine
@@ -778,14 +574,13 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
         // // dEdW = X^T @ dEdz
         __CU_MatmulBatch<<<dim3((outF + 15) / 16, (inF + 15) / 16), dim3(16, 16)>>>(d_dEdW, d_XT, d_dEdz, inF, batchSize, outF);
         // // Clip gradients
-        CU_ClipGradientValue(d_dEdW, inF * outF, 0.5f);
+        __CU_ClipGradientValue(d_dEdW, inF * outF, 0.5f);
         // // dEdb = mean of dEdz over batch
         // CopyAndPrintDeviceArray(d_dEdW, batchSize, 10, ("awiskiwiwi"));
         __CU_ComputeBiasGradient<<<(outF + 255) / 256, 256>>>(d_dEdb, d_dEdz, batchSize, outF);
         // // Update W and b
         __CU_UpdateParameter<<<(inF * outF + 255) / 256, 256>>>(W, d_dEdW, learningRate, inF * outF);
         __CU_UpdateParameter<<<(outF + 255) / 256, 256>>>(b, d_dEdb, learningRate, outF);
-        // printf("%d\n", layer);
 
         // // W^T
         __CU_Transpose<<<dim3((inF + 15) / 16, (outF + 15) / 16), dim3(16, 16)>>>(d_WT, W, inF, outF);
@@ -813,28 +608,9 @@ void BackwardProp(struct Layer *layerSequence, float *dEdy, int numLayers, int b
     cudaFree(current_dEdy); // free after last layer
 }
 
-// Normalizes array value to 0.0 - 1.0
-void Normalize(float *normalizedImg, unsigned char *images, int len)
-{
-    for (int i = 0; i < len; i++)
-    {
-        normalizedImg[i] = images[i] / 255.0f;
-    }
-}
-
-// Encodes a class label to one-hot vector
-void OneHotEncode(float *onehotLabels, unsigned char *labels, int len, int numClasses)
-{
-    for (int i = 0; i < len; i++)
-    {
-        for (int j = 0; j < numClasses; j++)
-        {
-            onehotLabels[i * numClasses + j] = (labels[i] == j) ? 1.0f : 0.0f;
-        }
-    }
-}
-
-__global__ void softmax_kernel(float *input, float *output, int batch_size, int size)
+// Softmax Kernel implementation of the softmax Function
+// raw values->probability distribution
+__global__ void __CU_Softmax(float *input, float *output, int batch_size, int size)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < batch_size)
@@ -865,11 +641,12 @@ void CU_SoftMaxBatch(float *device_input, float *device_output, int batchSize, i
     int threads = 128;
     int blocks = (batchSize + threads - 1) / threads;
 
-    softmax_kernel<<<blocks, threads>>>(device_input, device_output, batchSize, numClasses);
+    __CU_Softmax<<<blocks, threads>>>(device_input, device_output, batchSize, numClasses);
     // CUDA_CHECK(cudaGetLastError()); // cillegal memeroy access here
     // CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// Kernel to calcualte the gradient of the crossentropy loss fucntion
 __global__ void __CU_CrossEntropyGradient(float *dEdy, const float *logits, const float *y_batch, int total, int batchSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -879,16 +656,16 @@ __global__ void __CU_CrossEntropyGradient(float *dEdy, const float *logits, cons
     }
 }
 
+// Kernel wrapper function to calculate the crossentropy gradient
 void CU_CrossEntropyGradient(float *dEdy, const float *d_logits, const float *d_y_batch, int batchSize, int numClasses)
 {
     int total = batchSize * numClasses;
-
-    // Launch kernel on device pointers only
     int blockSize = 256;
     int gridSize = (total + blockSize - 1) / blockSize;
     __CU_CrossEntropyGradient<<<gridSize, blockSize>>>(dEdy, d_logits, d_y_batch, total, batchSize);
 }
 
+// Function to predict a label given an mnist(28x28) image
 void PredictSingle(int inputIndex, struct Layer *layerSequence, int numLayers, float *X, unsigned char *label, int numClasses)
 {
     int inputSize = 784;
@@ -926,7 +703,6 @@ void PredictSingle(int inputIndex, struct Layer *layerSequence, int numLayers, f
         {
             if (singleInput[i] > 0.5)
             {
-                /* code */
                 printf("# ");
             }
             else
@@ -947,35 +723,10 @@ void PredictSingle(int inputIndex, struct Layer *layerSequence, int numLayers, f
     CUDA_CHECK(cudaFree(logitsSoftmax));
 }
 
+// Main program
 int main(int argc, char const *argv[])
 {
     srand(time(NULL));
-    // Toggle this for GPU Acceleration
-
-    if (argc == 2)
-    {
-        printf("The argument supplied is %s\n", argv[1]);
-        if (strcmp("true", argv[1]) == 0)
-        {
-
-            gpuInference = true;
-            printf("Using GPU Inference\n");
-        }
-        else
-        {
-            printf("Using CPU Inference\n");
-        }
-    }
-    else if (argc > 2)
-    {
-        printf("Too many arguments supplied.\n");
-        return 0;
-    }
-    else
-    {
-        printf("One argument expected.\n");
-        return 0;
-    }
 
     // Data Source: https://github.com/cvdfoundation/mnist?tab=readme-ov-file
     const char *imagePath = "/app/dataset/MNIST/train-images-idx3-ubyte";
@@ -1029,7 +780,6 @@ int main(int argc, char const *argv[])
     int numLayers = sizeof(layerSequence) / sizeof(layerSequence[0]);
 
     printf("Log: There are %d layers in this network\n", numLayers);
-
     // Intialize weight and bias values
     for (int i = 0; i < numLayers; i++)
     {
